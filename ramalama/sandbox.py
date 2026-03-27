@@ -1,4 +1,5 @@
 import argparse
+import json
 import platform
 from collections.abc import Callable
 
@@ -43,9 +44,32 @@ def add_sandbox_subparsers(subparsers: argparse._SubParsersAction, img_comp: Cal
     )
     yield parser
 
+    parser = subparsers.add_parser("opencode", help="run OpenCode in a sandbox, backed by a local AI Model")
+    if getattr(runtime, "_add_inference_args", None):
+        runtime._add_inference_args(parser, "serve")  # type: ignore[attr-defined]
+    parser.add_argument("MODEL", completer=model_comp)
+    parser.add_argument(
+        "--opencode-image",
+        default="ghcr.io/anomalyco/opencode:1.3.3",
+        completer=img_comp,
+        help="OpenCode container image",
+    )
+    parser.add_argument(
+        "-w",
+        "--workdir",
+        help="local directory to mount into the sandbox container at /work",
+    )
+    parser.add_argument(
+        "ARGS",
+        nargs="*",
+        help="instructions for the sandbox to process non-interactively",
+    )
+    yield parser
+
 
 class SandboxEngineArgsType(BaseEngineArgsType):
     ARGS: list[str]
+    workdir: str | None
 
 
 class SandboxEngine(Engine):
@@ -63,6 +87,11 @@ class SandboxEngine(Engine):
     def add_network(self) -> None:
         self.add_args(f"--network=container:{self.args.name}")  # type: ignore[attr-defined]
 
+    def add_workdir(self, args: SandboxEngineArgsType):
+        if args.workdir:
+            self.add_volume(args.workdir, "/work", opts="rw")
+            self.add_args("--workdir=/work")
+
     def add_port_option(self) -> None:
         pass
 
@@ -78,7 +107,6 @@ class SandboxEngine(Engine):
 
 class GooseArgsType(SandboxEngineArgsType):
     goose_image: str
-    workdir: str | None
 
 
 class Goose:
@@ -96,7 +124,7 @@ class Goose:
                 self.engine.add_args("--uidmap=+1000:0")
         self.engine.add_name(f"goose-{args.name}")  # type: ignore[attr-defined]
         self.add_env_options(args, model_name)
-        self.add_workdir(args)
+        self.engine.add_workdir(args)
         self.engine.add_args(args.goose_image)
         if args.ARGS:
             self.engine.add_args("run", "-t", " ".join(args.ARGS))
@@ -113,10 +141,55 @@ class Goose:
         self.engine.add_env_option("GOOSE_TELEMETRY_ENABLED=false")
         self.engine.add_env_option("GOOSE_CLI_SHOW_THINKING=true")
 
-    def add_workdir(self, args: GooseArgsType):
-        if args.workdir:
-            self.engine.add_volume(args.workdir, "/work", opts="rw")
-            self.engine.add_args("--workdir=/work")
+    def run(self) -> None:
+        run_cmd(self.engine.exec_args, stdout=None, stdin=None)
+
+
+class OpenCodeArgsType(SandboxEngineArgsType):
+    opencode_image: str
+
+
+class OpenCode:
+    """
+    Run OpenCode in a sandbox.
+    Environment variables required by OpenCode will be set, and any workdir specified will be mounted into the
+    container. If args are provided, they will be passed to OpenCode to process non-interactively. If there are
+    no arguments and stdin is a tty, an interactive TUI session will be started. Otherwise, instructions will be
+    read from stdin.
+    """
+
+    def __init__(self, args: OpenCodeArgsType, model_name: str) -> None:
+        self.engine = SandboxEngine(args)
+        self.engine.add_name(f"opencode-{args.name}")  # type: ignore[attr-defined]
+        self.add_env_options(args, model_name)
+        self.engine.add_workdir(args)
+        self.engine.add_args(args.opencode_image)
+        if args.ARGS:
+            self.engine.add_args("run", " ".join(args.ARGS))
+        elif not self.engine.use_tty():
+            self.engine.add_args("run", "-")
+
+    def add_env_options(self, args: OpenCodeArgsType, model_name: str) -> None:
+        config = {
+            "$schema": "https://opencode.ai/config.json",
+            "model": f"ramalama/{model_name}",
+            "provider": {
+                "ramalama": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "RamaLama",
+                    "options": {
+                        "baseURL": f"http://localhost:{args.port}/v1",
+                        "apiKey": "ramalama",
+                    },
+                    "models": {
+                        model_name: {
+                            "name": model_name,
+                        },
+                    },
+                },
+            },
+        }
+        self.engine.add_env_option(f"OPENCODE_CONFIG_CONTENT={json.dumps(config)}")
 
     def run(self) -> None:
         run_cmd(self.engine.exec_args, stdout=None, stdin=None)
@@ -135,18 +208,23 @@ def run_sandbox(args):
 
     model.serve_nonblocking(args, cmd)
 
-    goose = Goose(args, model.model_alias)
+    if args.sandbox_agent == "goose":
+        agent = Goose(args, model.model_alias)
+    elif args.sandbox_agent == "opencode":
+        agent = OpenCode(args, model.model_alias)
+    else:
+        raise ValueError(f"unsupported sandbox agent: {args.sandbox_agent}")
 
     if args.dryrun:
-        goose.engine.dryrun()
+        agent.engine.dryrun()
         return
 
     try:
         # Wait for model server to be healthy
         model.wait_for_healthy(args)
 
-        # Launch Goose
-        goose.run()
+        # Launch agent
+        agent.run()
     finally:
         args.ignore = True
         stop_container(args, args.name, remove=True)

@@ -989,9 +989,9 @@ def sandbox_parser(subparsers):
 
     from ramalama.sandbox import add_sandbox_subparsers
 
-    for parser in add_sandbox_subparsers(sandbox_subparsers, local_images, local_models):
-        runtime_options(parser, "sandbox")
-        parser.set_defaults(func=sandbox_cli)
+    for sub_parser in add_sandbox_subparsers(sandbox_subparsers, local_images, local_models):
+        runtime_options(sub_parser, "sandbox")
+        sub_parser.set_defaults(func=sandbox_cli)
 
 
 def sandbox_cli(args):
